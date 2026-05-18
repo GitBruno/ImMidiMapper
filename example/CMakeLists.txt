@@ -5,19 +5,24 @@ target_link_libraries(ImMidiMapperDemo PRIVATE
     imgui_lib
     OpenGL::GL)
 
-# macOS: suppress OpenGL deprecation warnings (it still works on all macOS)
+# Windows: link SDL2main (entry-point shim) and suppress console in Release
+if(WIN32)
+    target_link_libraries(ImMidiMapperDemo PRIVATE SDL2::SDL2main)
+    set_target_properties(ImMidiMapperDemo PROPERTIES
+        WIN32_EXECUTABLE $<CONFIG:Release>)
+    # Copy SDL2.dll next to the binary so the exe can find it
+    add_custom_command(TARGET ImMidiMapperDemo POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:SDL2::SDL2>
+            $<TARGET_FILE_DIR:ImMidiMapperDemo>)
+endif()
+
+# macOS: suppress OpenGL deprecation warnings (still works on all macOS)
 if(APPLE)
     target_compile_definitions(ImMidiMapperDemo PRIVATE
         GL_SILENCE_DEPRECATION)
-    # Ensure the app can find its own resources when run from Finder
     set_target_properties(ImMidiMapperDemo PROPERTIES
         BUILD_RPATH "@executable_path")
-endif()
-
-# Windows: no console window in Release; keep it in Debug for printf output
-if(WIN32)
-    set_target_properties(ImMidiMapperDemo PROPERTIES
-        WIN32_EXECUTABLE $<CONFIG:Release>)
 endif()
 
 # Output directory — put the binary next to the source for easy running

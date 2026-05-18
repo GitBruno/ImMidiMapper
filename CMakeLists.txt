@@ -5,40 +5,35 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # =============================================================================
-# FetchContent — all external dependencies
+# Platform helpers
+# =============================================================================
+
+# Windows / MSYS2-UCRT64: expose system packages to CMake + pkg-config
+if(WIN32)
+    list(PREPEND CMAKE_PREFIX_PATH "C:/msys64/ucrt64")
+    set(PKG_CONFIG_EXECUTABLE "C:/msys64/ucrt64/bin/pkg-config.exe"
+        CACHE FILEPATH "pkg-config executable")
+endif()
+
+# =============================================================================
+# System dependencies  (SDL2, RtMidi via pkg-config)
+# =============================================================================
+find_package(OpenGL REQUIRED)
+find_package(SDL2   REQUIRED)
+find_package(PkgConfig REQUIRED)
+
+pkg_check_modules(RTMIDI REQUIRED IMPORTED_TARGET rtmidi)
+
+# =============================================================================
+# FetchContent — Dear ImGui only
 # =============================================================================
 include(FetchContent)
 
-# ── Dear ImGui ────────────────────────────────────────────────────────────────
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
     GIT_TAG        v1.91.6
     GIT_SHALLOW    TRUE)
 FetchContent_MakeAvailable(imgui)
-
-# ── SDL2 ──────────────────────────────────────────────────────────────────────
-FetchContent_Declare(SDL2
-    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-    GIT_TAG        release-2.30.9
-    GIT_SHALLOW    TRUE)
-set(SDL_SHARED  OFF CACHE BOOL "" FORCE)
-set(SDL_STATIC  ON  CACHE BOOL "" FORCE)
-set(SDL_TEST    OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(SDL2)
-
-# ── RtMidi ───────────────────────────────────────────────────────────────────
-FetchContent_Declare(rtmidi
-    GIT_REPOSITORY https://github.com/thestk/rtmidi.git
-    GIT_TAG        6.0.0
-    GIT_SHALLOW    TRUE)
-set(RTMIDI_BUILD_TESTING     OFF CACHE BOOL "" FORCE)
-set(RTMIDI_BUILD_STATIC_LIBS ON  CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(rtmidi)
-
-# =============================================================================
-# OpenGL
-# =============================================================================
-find_package(OpenGL REQUIRED)
 
 # =============================================================================
 # imgui static library  (SDL2 + OpenGL3 backends)
@@ -54,14 +49,15 @@ add_library(imgui_lib STATIC
 
 target_include_directories(imgui_lib PUBLIC
     ${imgui_SOURCE_DIR}
-    ${imgui_SOURCE_DIR}/backends)
+    ${imgui_SOURCE_DIR}/backends
+    ${SDL2_INCLUDE_DIRS})
 
 target_link_libraries(imgui_lib PUBLIC
-    SDL2::SDL2-static
+    SDL2::SDL2
     OpenGL::GL)
 
-# macOS: SDL2 needs these frameworks; OpenGL is deprecated but functional
 if(APPLE)
+    target_compile_definitions(imgui_lib PUBLIC GL_SILENCE_DEPRECATION)
     target_link_libraries(imgui_lib PUBLIC
         "-framework Cocoa"
         "-framework IOKit"
@@ -83,9 +79,8 @@ target_link_libraries(ImMidiMapper INTERFACE imgui_lib)
 add_library(ImMidiMapperRtMidi INTERFACE)
 target_include_directories(ImMidiMapperRtMidi INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
-target_link_libraries(ImMidiMapperRtMidi INTERFACE ImMidiMapper rtmidi)
+target_link_libraries(ImMidiMapperRtMidi INTERFACE ImMidiMapper PkgConfig::RTMIDI)
 
-# macOS: RtMidi needs CoreMIDI + CoreAudio
 if(APPLE)
     target_link_libraries(ImMidiMapperRtMidi INTERFACE
         "-framework CoreMIDI"
@@ -93,7 +88,6 @@ if(APPLE)
         "-framework CoreServices")
 endif()
 
-# Linux: RtMidi needs ALSA
 if(UNIX AND NOT APPLE)
     find_package(ALSA QUIET)
     if(ALSA_FOUND)

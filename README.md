@@ -7,6 +7,10 @@ MIDI I/O is a plug-in callback interface — bring your own backend, or use the 
 
 ---
 
+![preview](example\preview.png)
+
+---
+
 ## Features
 
 - **Two registration patterns** — wrapper widgets or `watchLast()` after any existing `ImGui::` call
