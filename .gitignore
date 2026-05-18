@@ -1,0 +1,13 @@
+build/
+bin/
+.cache/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.user
+*.suo
+.vs/
+*.xcodeproj/
+*.xcworkspace/
+midiMapper.json
