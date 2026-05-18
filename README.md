@@ -2,7 +2,7 @@
 
 > Map any Dear ImGui control to a MIDI CC — right-click to learn, zero extra dependencies.
 
-Pure **C++17 + Dear ImGui** extension. No openFrameworks, no platform SDK in the core.  
+Pure **C++17 + Dear ImGui** extension. No platform SDK in the core.  
 MIDI I/O is a plug-in callback interface — bring your own backend, or use the included **RtMidi** backend.
 
 ---
