@@ -31,7 +31,13 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <algorithm>
 #include <string>
+#include <vector>
+#include <filesystem>
 
 // =============================================================================
 // Simulated synth parameters (stand-ins for real engine params)
@@ -48,13 +54,81 @@ struct SynthParams {
     int   octave      = 0;       // -1 / 0 / +1
 };
 
+// Offscreen dump: --capture <dir> <WxH> <frames>
+static bool g_captureMode   = false;
+static char g_captureDir[512] = "";
+static int  g_captureW      = 720;
+static int  g_captureH      = 480;
+static int  g_captureFrames = 64;
+static int  g_captureIndex  = 0;
+static int  g_captureWarmup = 6;
+static bool g_captureBound  = false;
+
+static bool parseSizeWxH(const char* s, int* w, int* h)
+{
+    int ww = 0, hh = 0;
+    if (sscanf(s, "%dx%d", &ww, &hh) != 2 || ww < 64 || hh < 64) return false;
+    *w = ww; *h = hh;
+    return true;
+}
+
+static bool saveFramePpm(const char* path, int w, int h, const uint8_t* rgba)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    std::vector<uint8_t> row((size_t)w * 3);
+    for (int y = h - 1; y >= 0; --y) {
+        const uint8_t* src = rgba + (size_t)y * w * 4;
+        for (int x = 0; x < w; ++x) {
+            row[x * 3 + 0] = src[x * 4 + 0];
+            row[x * 3 + 1] = src[x * 4 + 1];
+            row[x * 3 + 2] = src[x * 4 + 2];
+        }
+        fwrite(row.data(), 1, row.size(), f);
+    }
+    fclose(f);
+    return true;
+}
+
+// Drive mapped CCs so sliders + green dots animate without hardware MIDI.
+static void driveCaptureMidi(ImMidiMapperRtMidi& mapper, int fi, int n)
+{
+    const float t = 2.f * 3.14159265f * (float)fi / (float)n;
+    auto cc = [](float u) {
+        return (int)std::lround(std::min(1.f, std::max(0.f, u)) * 127.f);
+    };
+
+    // Mid-loop learn demo on "decay": yellow pulse, then bind CC72 only.
+    // While learning, skip other CCs so the first event isn't Cutoff's CC74.
+    if (fi == n / 3)
+        mapper.startLearn("decay");
+    if (mapper.isLearning()) {
+        if (fi >= n / 3 + 12)
+            mapper.pushCC(1, 72, cc(0.55f));
+        return;
+    }
+
+    // Pre-bound: ch1 CC74 cutoff, CC71 resonance, CC7 volume
+    mapper.pushCC(1, 74, cc(0.5f + 0.42f * std::sin(t)));
+    mapper.pushCC(1, 71, cc(0.45f + 0.35f * std::sin(t * 1.3f + 0.7f)));
+    mapper.pushCC(1,  7, cc(0.70f + 0.22f * std::cos(t * 0.8f)));
+    if (fi > n / 3 + 12)
+        mapper.pushCC(1, 72, cc(0.5f + 0.4f * std::sin(t * 1.1f + 0.3f)));
+}
+
 // =============================================================================
 // Draw the synth control panel using both mapping patterns
 // =============================================================================
 static void DrawSynthPanel(ImMidiMapperRtMidi& mapper, SynthParams& p)
 {
-    ImGui::SetNextWindowSize(ImVec2(340, 420), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
+    if (g_captureMode) {
+        ImGui::SetNextWindowSize(ImVec2(340, 420), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(12, 28), ImGuiCond_Always);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(340, 420), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
+    }
 
     if (!ImGui::Begin("TB-303 Synth  (MIDI Mapper demo)")) { ImGui::End(); return; }
 
@@ -111,8 +185,25 @@ static void DrawSynthPanel(ImMidiMapperRtMidi& mapper, SynthParams& p)
 // =============================================================================
 // main
 // =============================================================================
-int main(int, char**)
+int main(int argc, char** argv)
 {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--capture") == 0) {
+            if (i + 3 >= argc) {
+                fprintf(stderr, "usage: --capture <dir> <WxH> <frames>\n");
+                return 1;
+            }
+            g_captureMode = true;
+            strncpy(g_captureDir, argv[++i], sizeof(g_captureDir) - 1);
+            if (!parseSizeWxH(argv[++i], &g_captureW, &g_captureH)) {
+                fprintf(stderr, "bad size (expected e.g. 720x480)\n");
+                return 1;
+            }
+            g_captureFrames = atoi(argv[++i]);
+            if (g_captureFrames < 1) g_captureFrames = 1;
+        }
+    }
+
     // ── SDL2 init ─────────────────────────────────────────────────────────────
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
         fprintf(stderr, "SDL_Init error: %s\n", SDL_GetError());
@@ -152,10 +243,12 @@ int main(int, char**)
     SDL_WindowFlags wf = (SDL_WindowFlags)(SDL_WINDOW_OPENGL
                                           | SDL_WINDOW_RESIZABLE
                                           | SDL_WINDOW_ALLOW_HIGHDPI);
+    const int winW = g_captureMode ? g_captureW : 1100;
+    const int winH = g_captureMode ? g_captureH : 680;
     SDL_Window* window = SDL_CreateWindow(
-        "ImMidiMapper Demo",
+        g_captureMode ? "ImMidiMapper Demo (capture)" : "ImMidiMapper Demo",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        1100, 680, wf);
+        winW, winH, wf);
     if (!window) {
         fprintf(stderr, "SDL_CreateWindow error: %s\n", SDL_GetError());
         return 1;
@@ -163,13 +256,15 @@ int main(int, char**)
 
     SDL_GLContext glCtx = SDL_GL_CreateContext(window);
     SDL_GL_MakeCurrent(window, glCtx);
-    SDL_GL_SetSwapInterval(1);
+    SDL_GL_SetSwapInterval(g_captureMode ? 0 : 1);
 
     // ── Dear ImGui setup ──────────────────────────────────────────────────────
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    if (g_captureMode)
+        io.IniFilename = nullptr;  // don't clobber interactive layout
 
     ImGui::StyleColorsDark();
     ImGui_ImplSDL2_InitForOpenGL(window, glCtx);
@@ -187,8 +282,21 @@ int main(int, char**)
     if (!ins .empty()) mapper.openInputPort (0);
     if (!outs.empty()) mapper.openOutputPort(0);
 
-    // Try to restore a previous mapping
-    mapper.load("midiMapper.json");
+    // Try to restore a previous mapping (skip in capture — scripted bindings)
+    if (!g_captureMode)
+        mapper.load("midiMapper.json");
+
+    if (g_captureMode) {
+        std::error_code ec;
+        std::filesystem::create_directories(g_captureDir, ec);
+        if (ec) {
+            fprintf(stderr, "cannot create capture dir %s: %s\n",
+                    g_captureDir, ec.message().c_str());
+            return 1;
+        }
+        fprintf(stderr, "capture → %s  %dx%d  %d frames\n",
+                g_captureDir, g_captureW, g_captureH, g_captureFrames);
+    }
 
     // ── App state ─────────────────────────────────────────────────────────────
     SynthParams synth;
@@ -206,6 +314,18 @@ int main(int, char**)
                 && ev.window.event == SDL_WINDOWEVENT_CLOSE
                 && ev.window.windowID == SDL_GetWindowID(window))
                 running = false;
+        }
+
+        if (g_captureMode && g_captureWarmup <= 0) {
+            if (!g_captureBound) {
+                // Bindings exist after the synth panel has drawn once.
+                mapper.assign("cutoff",    1, 74);
+                mapper.assign("resonance", 1, 71);
+                mapper.assign("volume",    1,  7);
+                g_captureBound = true;
+            }
+            const int fi = std::min(g_captureIndex, g_captureFrames - 1);
+            driveCaptureMidi(mapper, fi, g_captureFrames);
         }
 
         // Flush MIDI queue into bound variables
@@ -230,8 +350,13 @@ int main(int, char**)
         DrawSynthPanel(mapper, synth);
 
         // ── MIDI Mapper editor ────────────────────────────────────────────────
-        if (showMapperEditor)
+        if (showMapperEditor) {
+            if (g_captureMode) {
+                ImGui::SetNextWindowPos(ImVec2(360, 28), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(350, 420), ImGuiCond_Always);
+            }
             mapper.drawEditor(&showMapperEditor);
+        }
 
         // ── Standard ImGui demo ───────────────────────────────────────────────
         if (showImGuiDemo)
@@ -239,15 +364,37 @@ int main(int, char**)
 
         // ── Render ────────────────────────────────────────────────────────────
         ImGui::Render();
-        glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
+        int fbW = 0, fbH = 0;
+        SDL_GL_GetDrawableSize(window, &fbW, &fbH);
+        glViewport(0, 0, fbW, fbH);
         glClearColor(0.12f, 0.12f, 0.14f, 1.f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        if (g_captureMode) {
+            if (g_captureWarmup > 0) {
+                --g_captureWarmup;
+            } else if (g_captureIndex < g_captureFrames) {
+                std::vector<uint8_t> px((size_t)fbW * fbH * 4);
+                glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                glReadPixels(0, 0, fbW, fbH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                char path[768];
+                snprintf(path, sizeof(path), "%s/frame_%04d.ppm",
+                         g_captureDir, g_captureIndex);
+                if (!saveFramePpm(path, fbW, fbH, px.data()))
+                    fprintf(stderr, "failed to write %s\n", path);
+                ++g_captureIndex;
+                if (g_captureIndex >= g_captureFrames)
+                    running = false;
+            }
+        }
+
         SDL_GL_SwapWindow(window);
     }
 
     // ── Save mapping on exit ──────────────────────────────────────────────────
-    mapper.save("midiMapper.json");
+    if (!g_captureMode)
+        mapper.save("midiMapper.json");
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL2_Shutdown();

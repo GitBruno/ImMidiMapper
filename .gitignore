@@ -11,3 +11,4 @@ Makefile
 *.xcodeproj/
 *.xcworkspace/
 midiMapper.json
+example/_cap/
