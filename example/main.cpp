@@ -130,9 +130,14 @@ static void driveCaptureMidi(ImMidiMapperRtMidi& mapper, SynthParams& synth, int
 static void DrawSynthPanel(ImMidiMapperRtMidi& mapper, SynthParams& p)
 {
     if (g_captureMode) {
-        // Narrow strip — Mapper editor is the hero of the preview GIF.
-        ImGui::SetNextWindowSize(ImVec2(220, 440), ImGuiCond_Always);
-        ImGui::SetNextWindowPos(ImVec2(8, 28), ImGuiCond_Always);
+        // Square capture: compact top strip. Wide capture: narrow left column.
+        if (g_captureW == g_captureH) {
+            ImGui::SetNextWindowSize(ImVec2((float)g_captureW - 24.f, 130.f), ImGuiCond_Always);
+            ImGui::SetNextWindowPos(ImVec2(12.f, 72.f), ImGuiCond_Always);
+        } else {
+            ImGui::SetNextWindowSize(ImVec2(220.f, (float)g_captureH - 40.f), ImGuiCond_Always);
+            ImGui::SetNextWindowPos(ImVec2(8.f, 28.f), ImGuiCond_Always);
+        }
     } else {
         ImGui::SetNextWindowSize(ImVec2(340, 420), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
@@ -153,7 +158,8 @@ static void DrawSynthPanel(ImMidiMapperRtMidi& mapper, SynthParams& p)
     ImGui::SeparatorText(g_captureMode ? "VCF" : "VCF  (wrapper widgets)");
 
     mapper.SliderFloat("cutoff",    "Cutoff",    &p.cutoff,    0.f, 1.f);
-    mapper.SliderFloat("resonance", "Resonance", &p.resonance, 0.f, 1.f);
+    if (!g_captureMode || g_captureW != g_captureH)
+        mapper.SliderFloat("resonance", "Resonance", &p.resonance, 0.f, 1.f);
     mapper.SliderFloat("env_mod",   "Env Mod",   &p.envMod,    0.f, 1.f);
 
     if (!g_captureMode) {
@@ -193,14 +199,10 @@ static void DrawSynthPanel(ImMidiMapperRtMidi& mapper, SynthParams& p)
             p.cutoff, p.resonance, p.envMod, p.decay,
             p.volume, p.distortion,
             p.squareWave ? "on" : "off", p.octave);
-    } else {
-        ImGui::Spacing();
-        ImGui::SeparatorText("AMP");
+    } else if (g_captureW != g_captureH) {
         mapper.SliderFloat("volume", "Volume", &p.volume, 0.f, 1.f);
-        ImGui::Spacing();
-        ImGui::TextDisabled("Cut %.2f  Res %.2f\nEnv %.2f  Vol %.2f",
-                            p.cutoff, p.resonance, p.envMod, p.volume);
     }
+    // Square capture: only Cutoff + Env Mod (mapper table stays short).
 
     ImGui::End();
 }
@@ -373,9 +375,19 @@ int main(int argc, char** argv)
         // ── MIDI Mapper editor ────────────────────────────────────────────────
         if (showMapperEditor) {
             if (g_captureMode) {
-                // Hero panel — most of the frame
-                ImGui::SetNextWindowPos(ImVec2(236, 28), ImGuiCond_Always);
-                ImGui::SetNextWindowSize(ImVec2(556, 440), ImGuiCond_Always);
+                if (g_captureW == g_captureH) {
+                    // Stacked under synth — height fits table, not empty scroll void
+                    ImGui::SetNextWindowPos(ImVec2(12.f, 214.f), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2((float)g_captureW - 24.f, 310.f),
+                                             ImGuiCond_Always);
+                } else {
+                    ImGui::SetNextWindowPos(ImVec2(236.f, 28.f), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(
+                        ImVec2((float)g_captureW - 244.f, (float)g_captureH - 40.f),
+                        ImGuiCond_Always);
+                }
+            } else {
+                ImGui::SetNextWindowSize(ImVec2(540, 400), ImGuiCond_FirstUseEver);
             }
             mapper.drawEditor(&showMapperEditor);
         }

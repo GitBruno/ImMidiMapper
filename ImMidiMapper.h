@@ -703,7 +703,7 @@ void ImMidiMapper::drawBindingTable()
 
 void ImMidiMapper::drawEditor(bool* open)
 {
-    ImGui::SetNextWindowSize(ImVec2(540, 400), ImGuiCond_FirstUseEver);
+    // Window size/pos: caller may SetNextWindowSize/Pos before this (e.g. capture).
     if (!ImGui::Begin("MIDI Mapper###ImMidiMapper", open)) {
         ImGui::End();  return;
     }

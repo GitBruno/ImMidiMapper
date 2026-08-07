@@ -12,3 +12,4 @@ Makefile
 *.xcworkspace/
 midiMapper.json
 example/_cap/
+example/_cap_sq/
