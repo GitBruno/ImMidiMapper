@@ -57,9 +57,9 @@ struct SynthParams {
 // Offscreen dump: --capture <dir> <WxH> <frames>
 static bool g_captureMode   = false;
 static char g_captureDir[512] = "";
-static int  g_captureW      = 720;
+static int  g_captureW      = 800;
 static int  g_captureH      = 480;
-static int  g_captureFrames = 64;
+static int  g_captureFrames = 96;
 static int  g_captureIndex  = 0;
 static int  g_captureWarmup = 6;
 static bool g_captureBound  = false;
@@ -91,30 +91,37 @@ static bool saveFramePpm(const char* path, int w, int h, const uint8_t* rgba)
     return true;
 }
 
-// Drive mapped CCs so sliders + green dots animate without hardware MIDI.
-static void driveCaptureMidi(ImMidiMapperRtMidi& mapper, int fi, int n)
+// Capture story: establish mapped CCs → MIDI Learn adds Env Mod → long hold.
+// Learn happens early so most of the loop is the "added" state (not an unbind).
+static void driveCaptureMidi(ImMidiMapperRtMidi& mapper, SynthParams& synth, int fi, int n)
 {
     const float t = 2.f * 3.14159265f * (float)fi / (float)n;
     auto cc = [](float u) {
         return (int)std::lround(std::min(1.f, std::max(0.f, u)) * 127.f);
     };
+    auto cutoffAt = [&](float phase) {
+        return 0.5f + 0.38f * std::sin(phase);
+    };
 
-    // Mid-loop learn demo on "decay": yellow pulse, then bind CC72 only.
-    // While learning, skip other CCs so the first event isn't Cutoff's CC74.
-    if (fi == n / 3)
-        mapper.startLearn("decay");
+    const int tLearn = (int)(n * 0.12f);   // start Learn early
+    const int tBind  = tLearn + 20;        // yellow Learn banner dwell
+
+    if (fi == tLearn)
+        mapper.startLearn("env_mod");
+
+    // While learning we must not pushCC other controls — the first CC completes
+    // Learn. Keep Cutoff moving by writing the float directly so the UI doesn't
+    // look frozen.
     if (mapper.isLearning()) {
-        if (fi >= n / 3 + 12)
-            mapper.pushCC(1, 72, cc(0.55f));
+        synth.cutoff = cutoffAt(t);
+        if (fi >= tBind)
+            mapper.pushCC(1, 73, cc(0.62f));
         return;
     }
 
-    // Pre-bound: ch1 CC74 cutoff, CC71 resonance, CC7 volume
-    mapper.pushCC(1, 74, cc(0.5f + 0.42f * std::sin(t)));
-    mapper.pushCC(1, 71, cc(0.45f + 0.35f * std::sin(t * 1.3f + 0.7f)));
-    mapper.pushCC(1,  7, cc(0.70f + 0.22f * std::cos(t * 0.8f)));
-    if (fi > n / 3 + 12)
-        mapper.pushCC(1, 72, cc(0.5f + 0.4f * std::sin(t * 1.1f + 0.3f)));
+    mapper.pushCC(1, 74, cc(cutoffAt(t)));
+    if (fi >= tBind)
+        mapper.pushCC(1, 73, cc(0.55f + 0.28f * std::sin(t * 0.9f + 1.1f)));
 }
 
 // =============================================================================
@@ -123,61 +130,77 @@ static void driveCaptureMidi(ImMidiMapperRtMidi& mapper, int fi, int n)
 static void DrawSynthPanel(ImMidiMapperRtMidi& mapper, SynthParams& p)
 {
     if (g_captureMode) {
-        ImGui::SetNextWindowSize(ImVec2(340, 420), ImGuiCond_Always);
-        ImGui::SetNextWindowPos(ImVec2(12, 28), ImGuiCond_Always);
+        // Narrow strip — Mapper editor is the hero of the preview GIF.
+        ImGui::SetNextWindowSize(ImVec2(220, 440), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(8, 28), ImGuiCond_Always);
     } else {
         ImGui::SetNextWindowSize(ImVec2(340, 420), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
     }
 
-    if (!ImGui::Begin("TB-303 Synth  (MIDI Mapper demo)")) { ImGui::End(); return; }
+    if (!ImGui::Begin(g_captureMode ? "Synth" : "TB-303 Synth  (MIDI Mapper demo)")) {
+        ImGui::End();
+        return;
+    }
 
-    ImGui::TextDisabled("Right-click any control  ->  MIDI Learn...");
+    if (!g_captureMode)
+        ImGui::TextDisabled("Right-click any control  ->  MIDI Learn...");
+    else
+        ImGui::TextDisabled("right-click -> Learn");
     ImGui::Spacing();
 
     // ── Pattern 1: wrapper widgets ───────────────────────────────────────────
-    ImGui::SeparatorText("VCF  (wrapper widgets)");
+    ImGui::SeparatorText(g_captureMode ? "VCF" : "VCF  (wrapper widgets)");
 
     mapper.SliderFloat("cutoff",    "Cutoff",    &p.cutoff,    0.f, 1.f);
     mapper.SliderFloat("resonance", "Resonance", &p.resonance, 0.f, 1.f);
     mapper.SliderFloat("env_mod",   "Env Mod",   &p.envMod,    0.f, 1.f);
 
-    ImGui::Spacing();
-    ImGui::SeparatorText("ENV  (wrapper widgets)");
+    if (!g_captureMode) {
+        ImGui::Spacing();
+        ImGui::SeparatorText("ENV  (wrapper widgets)");
 
-    mapper.SliderFloat("decay",       "Decay",       &p.decay,       0.f, 1.f);
-    mapper.SliderFloat("accent_lvl",  "Accent Level",&p.accentLevel, 0.f, 1.f);
+        mapper.SliderFloat("decay",       "Decay",       &p.decay,       0.f, 1.f);
+        mapper.SliderFloat("accent_lvl",  "Accent Level",&p.accentLevel, 0.f, 1.f);
 
-    ImGui::Spacing();
-    ImGui::SeparatorText("AMP  (wrapper widgets)");
+        ImGui::Spacing();
+        ImGui::SeparatorText("AMP  (wrapper widgets)");
 
-    mapper.SliderFloat("volume",     "Volume",      &p.volume,     0.f, 1.f);
-    mapper.SliderFloat("distortion", "Distortion",  &p.distortion, 0.f, 1.f);
+        mapper.SliderFloat("volume",     "Volume",      &p.volume,     0.f, 1.f);
+        mapper.SliderFloat("distortion", "Distortion",  &p.distortion, 0.f, 1.f);
 
-    // ── Pattern 2: existing ImGui:: widget + watchLast() ────────────────────
-    ImGui::Spacing();
-    ImGui::SeparatorText("OSC  (watchLast on existing widgets)");
+        // ── Pattern 2: existing ImGui:: widget + watchLast() ────────────────────
+        ImGui::Spacing();
+        ImGui::SeparatorText("OSC  (watchLast on existing widgets)");
 
-    ImGui::Checkbox("Square Wave", &p.squareWave);
-    mapper.watchLast("square_wave", &p.squareWave, "Square Wave");
+        ImGui::Checkbox("Square Wave", &p.squareWave);
+        mapper.watchLast("square_wave", &p.squareWave, "Square Wave");
 
-    ImGui::Spacing();
-    const char* octNames[] = {"-1", "0", "+1"};
-    int octIdx = p.octave + 1;
-    ImGui::SetNextItemWidth(120.f);
-    if (ImGui::Combo("Octave", &octIdx, octNames, 3))
-        p.octave = octIdx - 1;
-    mapper.watchLast("octave", &octIdx, 0, 2, "Octave");
+        ImGui::Spacing();
+        const char* octNames[] = {"-1", "0", "+1"};
+        int octIdx = p.octave + 1;
+        ImGui::SetNextItemWidth(120.f);
+        if (ImGui::Combo("Octave", &octIdx, octNames, 3))
+            p.octave = octIdx - 1;
+        mapper.watchLast("octave", &octIdx, 0, 2, "Octave");
 
-    // ── Live values readout ──────────────────────────────────────────────────
-    ImGui::Spacing();
-    ImGui::SeparatorText("Live values");
-    ImGui::TextDisabled(
-        "Cut %.2f  Res %.2f  Env %.2f  Dec %.2f\n"
-        "Vol %.2f  Dst %.2f  Sq %s   Oct %+d",
-        p.cutoff, p.resonance, p.envMod, p.decay,
-        p.volume, p.distortion,
-        p.squareWave ? "on" : "off", p.octave);
+        // ── Live values readout ──────────────────────────────────────────────────
+        ImGui::Spacing();
+        ImGui::SeparatorText("Live values");
+        ImGui::TextDisabled(
+            "Cut %.2f  Res %.2f  Env %.2f  Dec %.2f\n"
+            "Vol %.2f  Dst %.2f  Sq %s   Oct %+d",
+            p.cutoff, p.resonance, p.envMod, p.decay,
+            p.volume, p.distortion,
+            p.squareWave ? "on" : "off", p.octave);
+    } else {
+        ImGui::Spacing();
+        ImGui::SeparatorText("AMP");
+        mapper.SliderFloat("volume", "Volume", &p.volume, 0.f, 1.f);
+        ImGui::Spacing();
+        ImGui::TextDisabled("Cut %.2f  Res %.2f\nEnv %.2f  Vol %.2f",
+                            p.cutoff, p.resonance, p.envMod, p.volume);
+    }
 
     ImGui::End();
 }
@@ -318,14 +341,12 @@ int main(int argc, char** argv)
 
         if (g_captureMode && g_captureWarmup <= 0) {
             if (!g_captureBound) {
-                // Bindings exist after the synth panel has drawn once.
-                mapper.assign("cutoff",    1, 74);
-                mapper.assign("resonance", 1, 71);
-                mapper.assign("volume",    1,  7);
+                // One pre-bound control — keeps the frame calm; Learn adds Env Mod.
+                mapper.assign("cutoff", 1, 74);
                 g_captureBound = true;
             }
             const int fi = std::min(g_captureIndex, g_captureFrames - 1);
-            driveCaptureMidi(mapper, fi, g_captureFrames);
+            driveCaptureMidi(mapper, synth, fi, g_captureFrames);
         }
 
         // Flush MIDI queue into bound variables
@@ -352,8 +373,9 @@ int main(int argc, char** argv)
         // ── MIDI Mapper editor ────────────────────────────────────────────────
         if (showMapperEditor) {
             if (g_captureMode) {
-                ImGui::SetNextWindowPos(ImVec2(360, 28), ImGuiCond_Always);
-                ImGui::SetNextWindowSize(ImVec2(350, 420), ImGuiCond_Always);
+                // Hero panel — most of the frame
+                ImGui::SetNextWindowPos(ImVec2(236, 28), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(556, 440), ImGuiCond_Always);
             }
             mapper.drawEditor(&showMapperEditor);
         }

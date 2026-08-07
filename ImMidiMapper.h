@@ -28,12 +28,10 @@
 // ───────────
 //  mapper.save("map.json");  /  mapper.load("map.json");
 //
-// INDICATOR DOT
-// ─────────────
-//  A small circle is drawn in the top-right corner of each registered item:
-//    ● gray    = registered, no CC yet
-//    ● green   = mapped
-//    ● yellow  = currently learning (pulsing)
+// INDICATOR / STATUS
+// ──────────────────
+//  Mapping state is shown in the editor table (Ch / CC columns) and the
+//  yellow "* Learning: …" banner — no overlay dots on widgets.
 // =============================================================================
 
 #include "imgui.h"
@@ -395,25 +393,10 @@ void ImMidiMapper::sendCC(ImMidiBinding& b)
 // ─────────────────────────────────────────────────────────────────────────────
 // Visual indicator dot — overlaid on the top-right of the last ImGui item
 // ─────────────────────────────────────────────────────────────────────────────
-void ImMidiMapper::drawIndicator(const std::string& id)
+void ImMidiMapper::drawIndicator(const std::string& /*id*/)
 {
-    auto* b = findBinding(id);
-    if (!b) return;
-
-    ImVec2 p = ImGui::GetItemRectMax();
-    p.x -= 5.f;  p.y -= 5.f;
-
-    ImU32 col;
-    if (isLearning(id)) {
-        float t = (float)ImGui::GetTime();
-        float a = 0.55f + 0.45f * sinf(t * 8.f);
-        col = ImGui::ColorConvertFloat4ToU32(ImVec4(1.f, 0.88f, 0.f, a));
-    } else if (b->isMapped()) {
-        col = IM_COL32(50, 210, 80, 220);
-    } else {
-        col = IM_COL32(110, 110, 110, 130);
-    }
-    ImGui::GetWindowDrawList()->AddCircleFilled(p, 4.f, col);
+    // Intentionally empty: Ch/CC + Learn banner already communicate state.
+    // Overlay dots were easy to mistake for a cursor / hit target.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -434,10 +417,10 @@ void ImMidiMapper::handleContextMenu(const std::string& id,
     ImGui::Separator();
 
     if (isLearning(id)) {
-        ImGui::TextColored({1.f, 0.88f, 0.f, 1.f}, "* Waiting for CC…");
+        ImGui::TextColored({1.f, 0.88f, 0.f, 1.f}, "* Waiting for CC...");
         if (ImGui::MenuItem("Cancel")) stopLearn();
     } else {
-        if (ImGui::MenuItem("MIDI Learn…")) startLearn(id);
+        if (ImGui::MenuItem("MIDI Learn...")) startLearn(id);
     }
 
     if (b && b->isMapped()) {
@@ -658,10 +641,9 @@ void ImMidiMapper::drawBindingTable()
         | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
 
     float tableH = ImGui::GetContentRegionAvail().y - 40.f;
-    if (!ImGui::BeginTable("##imm_tbl", 6, kFlags, ImVec2(0, tableH)))
+    if (!ImGui::BeginTable("##imm_tbl", 5, kFlags, ImVec2(0, tableH)))
         return;
 
-    ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed,   18.f);
     ImGui::TableSetupColumn("Control", ImGuiTableColumnFlags_WidthStretch,  2.f);
     ImGui::TableSetupColumn("Ch",      ImGuiTableColumnFlags_WidthFixed,   34.f);
     ImGui::TableSetupColumn("CC",      ImGuiTableColumnFlags_WidthFixed,   44.f);
@@ -674,25 +656,18 @@ void ImMidiMapper::drawBindingTable()
         ImGui::TableNextRow();
         ImGui::PushID(b.id.c_str());
 
-        // Dot
-        ImGui::TableSetColumnIndex(0);
-        if (isLearning(b.id)) {
-            float a = 0.55f + 0.45f * sinf((float)ImGui::GetTime() * 8.f);
-            ImGui::TextColored({1.f, 0.88f, 0.f, a}, "*");
-        } else if (b.isMapped()) {
-            ImGui::TextColored({0.22f, 0.82f, 0.32f, 1.f}, "\xe2\x97\x8f");
-        } else {
-            ImGui::TextDisabled("\xe2\x97\x8b");
-        }
-
         // Label
-        ImGui::TableSetColumnIndex(1);
-        ImGui::TextUnformatted(b.label.empty() ? b.id.c_str() : b.label.c_str());
+        ImGui::TableSetColumnIndex(0);
+        if (isLearning(b.id))
+            ImGui::TextColored({1.f, 0.88f, 0.f, 1.f}, "%s",
+                               b.label.empty() ? b.id.c_str() : b.label.c_str());
+        else
+            ImGui::TextUnformatted(b.label.empty() ? b.id.c_str() : b.label.c_str());
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("id: %s", b.id.c_str());
 
         // Channel
-        ImGui::TableSetColumnIndex(2);
+        ImGui::TableSetColumnIndex(1);
         if (b.isMapped()) {
             ImGui::SetNextItemWidth(30.f);
             if (ImGui::InputInt("##ch", &b.channel, 0))
@@ -700,7 +675,7 @@ void ImMidiMapper::drawBindingTable()
         } else { ImGui::TextDisabled("-"); }
 
         // CC (editable)
-        ImGui::TableSetColumnIndex(3);
+        ImGui::TableSetColumnIndex(2);
         if (b.isMapped()) {
             ImGui::SetNextItemWidth(38.f);
             if (ImGui::InputInt("##cc", &b.cc, 0))
@@ -708,11 +683,11 @@ void ImMidiMapper::drawBindingTable()
         } else { ImGui::TextDisabled("-"); }
 
         // Two-way
-        ImGui::TableSetColumnIndex(4);
+        ImGui::TableSetColumnIndex(3);
         ImGui::Checkbox("##tw", &b.twoWay);
 
         // Actions
-        ImGui::TableSetColumnIndex(5);
+        ImGui::TableSetColumnIndex(4);
         if (isLearning(b.id)) {
             if (ImGui::SmallButton("Cancel")) stopLearn();
         } else {
@@ -748,9 +723,9 @@ void ImMidiMapper::drawEditor(bool* open)
 
     ImGui::Separator();
     ImGui::Spacing();
-    if (ImGui::Button("Save…")) save("midiMapper.json");
+    if (ImGui::Button("Save...")) save("midiMapper.json");
     ImGui::SameLine();
-    if (ImGui::Button("Load…")) load("midiMapper.json");
+    if (ImGui::Button("Load...")) load("midiMapper.json");
     ImGui::SameLine();
     if (ImGui::Button("Clear All")) clearAll();
     ImGui::SameLine();

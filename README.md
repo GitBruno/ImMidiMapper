@@ -15,7 +15,7 @@ MIDI I/O is a plug-in callback interface — bring your own backend, or use the 
 
 - **Two registration patterns** — wrapper widgets or `watchLast()` after any existing `ImGui::` call
 - **Right-click MIDI Learn** on any registered control
-- **Indicator dot** — gray (unbound) · green (mapped) · pulsing yellow (learning)
+- **Learning banner** — yellow `* Learning: …` while waiting for a CC
 - **Two-way sync** — drag a UI control → send CC back to hardware
 - **Persistence** — save/load mappings as JSON (hand-rolled, no extra dependency)
 - **Editor window** — full binding table, inline CC editing, port selector
