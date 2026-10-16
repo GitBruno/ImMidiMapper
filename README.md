@@ -139,7 +139,9 @@ mapper.onSendCC = [](int ch, int cc, int val) {
 | `assign(id, channel, cc)` | Manual CC assignment |
 | `clearBinding(id)` | Remove a CC assignment |
 | `save(path)` / `load(path)` | JSON persistence |
-| `drawEditor(&visible)` | Full mapping editor window |
+| `drawEditor(&visible)` | Full mapping editor window (sizes from the font, so themed fonts fit) |
+| `editorFile` | Path the editor's Save... / Load... buttons use (default `midiMapper.json`) |
+| `onBindingsChanged` | Callback after the editor edits Ch / CC / 2-way, clears, or loads |
 | `bind(id, &val, ...)` | Register without drawing a widget |
 
 ---

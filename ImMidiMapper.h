@@ -41,6 +41,7 @@
 #include <mutex>
 #include <functional>
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -88,6 +89,13 @@ public:
 
     // ── Optional: draw custom port-selector UI inside drawEditor() ──────────
     std::function<void()> drawPortsUI;
+
+    // ── Optional: called when the editor edits a binding (Ch / CC / 2-way /
+    //    clear / Clear All). Hosts that own persistence save here. ──────────
+    std::function<void()> onBindingsChanged;
+
+    // ── File used by the editor's Save... / Load... buttons ─────────────────
+    std::string editorFile {"midiMapper.json"};
 
     // =========================================================================
     // Lifecycle
@@ -219,7 +227,8 @@ private:
     bool postWidget(const std::string& id, const std::string& label,
                     bool widgetChanged);
 
-    void drawBindingTable();
+    /// `footerH` is the height the caller still needs below the table.
+    void drawBindingTable(float footerH);
 
     // Tiny JSON helpers
     static std::string jsonEscape(const std::string& s);
@@ -634,30 +643,49 @@ bool ImMidiMapper::load(const std::string& path)
 // ─────────────────────────────────────────────────────────────────────────────
 // Editor window
 // ─────────────────────────────────────────────────────────────────────────────
-void ImMidiMapper::drawBindingTable()
+void ImMidiMapper::drawBindingTable(float footerH)
 {
     constexpr ImGuiTableFlags kFlags =
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg
-        | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+        | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
 
-    float tableH = ImGui::GetContentRegionAvail().y - 40.f;
+    // Sizes come from the font and style, not pixel constants, so a themed
+    // or scaled font neither clips the buttons nor leaves the window with a
+    // scrollbar of its own: the table takes what the footer does not need.
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float em      = ImGui::GetFontSize();
+    const float cellPad = st.CellPadding.x * 2.f;
+    const float padX    = st.FramePadding.x * 2.f;
+    const float chW     = ImGui::CalcTextSize("16").x  + padX + cellPad + em * 0.5f;
+    const float ccW     = ImGui::CalcTextSize("255").x + padX + cellPad + em * 0.5f;
+    const float twW     = std::max(ImGui::CalcTextSize("2-way").x,
+                                   ImGui::GetFrameHeight()) + cellPad;
+    const float actW    = ImGui::CalcTextSize("Cancel").x + ImGui::CalcTextSize("x").x
+                        + padX * 2.f + st.ItemSpacing.x + cellPad;
+
+    float tableH = ImGui::GetContentRegionAvail().y - footerH;
+    const float minH = ImGui::GetFrameHeightWithSpacing() * 3.f;
+    if (tableH < minH) tableH = minH;
+
     if (!ImGui::BeginTable("##imm_tbl", 5, kFlags, ImVec2(0, tableH)))
         return;
 
-    ImGui::TableSetupColumn("Control", ImGuiTableColumnFlags_WidthStretch,  2.f);
-    ImGui::TableSetupColumn("Ch",      ImGuiTableColumnFlags_WidthFixed,   34.f);
-    ImGui::TableSetupColumn("CC",      ImGuiTableColumnFlags_WidthFixed,   44.f);
-    ImGui::TableSetupColumn("2-way",   ImGuiTableColumnFlags_WidthFixed,   50.f);
-    ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed,   88.f);
+    ImGui::TableSetupColumn("Control",   ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("Ch",        ImGuiTableColumnFlags_WidthFixed, chW);
+    ImGui::TableSetupColumn("CC",        ImGuiTableColumnFlags_WidthFixed, ccW);
+    ImGui::TableSetupColumn("2-way",     ImGuiTableColumnFlags_WidthFixed, twW);
+    ImGui::TableSetupColumn("##actions", ImGuiTableColumnFlags_WidthFixed, actW);
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableHeadersRow();
 
+    bool changed = false;
     for (auto& b : m_bindings) {
         ImGui::TableNextRow();
         ImGui::PushID(b.id.c_str());
 
         // Label
         ImGui::TableSetColumnIndex(0);
+        ImGui::AlignTextToFramePadding();
         if (isLearning(b.id))
             ImGui::TextColored({1.f, 0.88f, 0.f, 1.f}, "%s",
                                b.label.empty() ? b.id.c_str() : b.label.c_str());
@@ -669,22 +697,26 @@ void ImMidiMapper::drawBindingTable()
         // Channel
         ImGui::TableSetColumnIndex(1);
         if (b.isMapped()) {
-            ImGui::SetNextItemWidth(30.f);
-            if (ImGui::InputInt("##ch", &b.channel, 0))
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputInt("##ch", &b.channel, 0)) {
                 b.channel = std::clamp(b.channel, 0, 16);
-        } else { ImGui::TextDisabled("-"); }
+                changed = true;
+            }
+        } else { ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("-"); }
 
-        // CC (editable)
+        // CC (editable). Notes live at 128 + note, so the range is 0..255.
         ImGui::TableSetColumnIndex(2);
         if (b.isMapped()) {
-            ImGui::SetNextItemWidth(38.f);
-            if (ImGui::InputInt("##cc", &b.cc, 0))
-                b.cc = std::clamp(b.cc, 0, 127);
-        } else { ImGui::TextDisabled("-"); }
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputInt("##cc", &b.cc, 0)) {
+                b.cc = std::clamp(b.cc, 0, 255);
+                changed = true;
+            }
+        } else { ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("-"); }
 
         // Two-way
         ImGui::TableSetColumnIndex(3);
-        ImGui::Checkbox("##tw", &b.twoWay);
+        if (ImGui::Checkbox("##tw", &b.twoWay)) changed = true;
 
         // Actions
         ImGui::TableSetColumnIndex(4);
@@ -694,11 +726,15 @@ void ImMidiMapper::drawBindingTable()
             if (ImGui::SmallButton("Learn"))  startLearn(b.id);
         }
         ImGui::SameLine();
-        if (ImGui::SmallButton("x")) clearBinding(b.id);
+        ImGui::BeginDisabled(!b.isMapped());
+        if (ImGui::SmallButton("x")) { clearBinding(b.id); changed = true; }
+        ImGui::EndDisabled();
 
         ImGui::PopID();
     }
     ImGui::EndTable();
+
+    if (changed && onBindingsChanged) onBindingsChanged();
 }
 
 void ImMidiMapper::drawEditor(bool* open)
@@ -712,6 +748,7 @@ void ImMidiMapper::drawEditor(bool* open)
     if (drawPortsUI) { drawPortsUI(); ImGui::Separator(); ImGui::Spacing(); }
 
     if (!m_learningId.empty()) {
+        ImGui::AlignTextToFramePadding();
         ImGui::TextColored({1.f, 0.88f, 0.f, 1.f},
             "* Learning: %s  -- move a CC knob/fader", m_learningId.c_str());
         ImGui::SameLine();
@@ -719,16 +756,22 @@ void ImMidiMapper::drawEditor(bool* open)
         ImGui::Spacing();
     }
 
-    drawBindingTable();
+    // Footer below the table: Separator + Spacing + one button row.
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float footerH = st.ItemSpacing.y + 1.f      // Separator
+                        + st.ItemSpacing.y             // Spacing
+                        + ImGui::GetFrameHeight();     // Buttons
+    drawBindingTable(footerH);
 
     ImGui::Separator();
     ImGui::Spacing();
-    if (ImGui::Button("Save...")) save("midiMapper.json");
+    if (ImGui::Button("Save...")) save(editorFile);
     ImGui::SameLine();
-    if (ImGui::Button("Load...")) load("midiMapper.json");
+    if (ImGui::Button("Load...")) { load(editorFile); if (onBindingsChanged) onBindingsChanged(); }
     ImGui::SameLine();
-    if (ImGui::Button("Clear All")) clearAll();
+    if (ImGui::Button("Clear All")) { clearAll(); if (onBindingsChanged) onBindingsChanged(); }
     ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("%d registered  /  %d mapped",
         (int)m_bindings.size(),
         (int)std::count_if(m_bindings.begin(), m_bindings.end(),
