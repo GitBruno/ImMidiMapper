@@ -94,6 +94,9 @@ public:
     //    clear / Clear All). Hosts that own persistence save here. ──────────
     std::function<void()> onBindingsChanged;
 
+    // ── Optional: extra UI inside drawEditor(), below the mapper table. ────
+    std::function<void()> drawEditorExtra;
+
     // ── File used by the editor's Save... / Load... buttons ─────────────────
     std::string editorFile {"midiMapper.json"};
 
@@ -116,7 +119,11 @@ public:
     void pushCC(int channel, int cc, int value);
 
     /// Push a Note-On as a boolean trigger (velocity > 0 = true).
+    /// Velocity 0 is note-off (bool targets go false).
     void pushNoteOn(int channel, int note, int velocity);
+
+    /// Send two-way CC for every mapped binding whose value moved.
+    void flushTwoWay();
 
     // =========================================================================
     // Registration
@@ -259,6 +266,7 @@ void ImMidiMapper::update()
     for (auto& ev : events) {
         // Learn: first event after startLearn() fires the binding
         if (!m_learningId.empty()) {
+            if (ev.isNote && ev.value <= 0) continue; // note-off is not a learn hit
             int effectiveCC = ev.isNote ? (128 + ev.cc) : ev.cc;
             assign(m_learningId, ev.channel, effectiveCC);
             if (onLearnComplete) onLearnComplete(m_learningId, ev.channel, effectiveCC);
@@ -284,7 +292,6 @@ void ImMidiMapper::pushCC(int channel, int cc, int value)
 
 void ImMidiMapper::pushNoteOn(int channel, int note, int velocity)
 {
-    if (velocity <= 0) return;
     std::lock_guard<std::mutex> lk(m_queueMutex);
     m_queue.push_back({channel, note, velocity, true});
 }
@@ -386,6 +393,7 @@ void ImMidiMapper::applyCC(ImMidiBinding& b, int value)
 void ImMidiMapper::sendCC(ImMidiBinding& b)
 {
     if (!onSendCC || !b.twoWay || !b.isMapped()) return;
+    if (b.cc < 0 || b.cc > 127) return; // notes live at 128+n; feedback is CC only
 
     float n = 0.f;
     if      (b.fTarget) n = (*b.fTarget - b.fMin) / std::max(b.fMax - b.fMin, 1e-6f);
@@ -397,6 +405,11 @@ void ImMidiMapper::sendCC(ImMidiBinding& b)
     b.lastSent = n;
     int ch = (b.channel == 0) ? 1 : b.channel;
     onSendCC(ch, b.cc, (int)(n * 127.f));
+}
+
+void ImMidiMapper::flushTwoWay()
+{
+    for (auto& b : m_bindings) sendCC(b);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -744,8 +757,9 @@ void ImMidiMapper::drawEditor(bool* open)
         ImGui::End();  return;
     }
 
-    // Optional: custom port-selector drawn by the backend
-    if (drawPortsUI) { drawPortsUI(); ImGui::Separator(); ImGui::Spacing(); }
+    // Optional: custom port-selector drawn by the backend.
+    // A full-width control at the end of that UI is the break; no extra rule.
+    if (drawPortsUI) drawPortsUI();
 
     if (!m_learningId.empty()) {
         ImGui::AlignTextToFramePadding();
@@ -756,26 +770,34 @@ void ImMidiMapper::drawEditor(bool* open)
         ImGui::Spacing();
     }
 
-    // Footer below the table: Separator + Spacing + one button row.
+    // Footer is one filled button row plus the count. The row is the break.
     const ImGuiStyle& st = ImGui::GetStyle();
-    const float footerH = st.ItemSpacing.y + 1.f      // Separator
-                        + st.ItemSpacing.y             // Spacing
-                        + ImGui::GetFrameHeight();     // Buttons
+    const float footerH = ImGui::GetFrameHeight() + st.ItemSpacing.y
+                        + ImGui::GetTextLineHeight();
     drawBindingTable(footerH);
 
-    ImGui::Separator();
-    ImGui::Spacing();
-    if (ImGui::Button("Save...")) save(editorFile);
+    const float gap = st.ItemSpacing.x;
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const float bw = std::max(1.f, (avail - gap * 2.f) / 3.f);
+    if (ImGui::Button("Save...", ImVec2(bw, 0.f))) save(editorFile);
     ImGui::SameLine();
-    if (ImGui::Button("Load...")) { load(editorFile); if (onBindingsChanged) onBindingsChanged(); }
+    if (ImGui::Button("Load...", ImVec2(bw, 0.f))) {
+        load(editorFile);
+        if (onBindingsChanged) onBindingsChanged();
+    }
     ImGui::SameLine();
-    if (ImGui::Button("Clear All")) { clearAll(); if (onBindingsChanged) onBindingsChanged(); }
-    ImGui::SameLine();
-    ImGui::AlignTextToFramePadding();
+    if (ImGui::Button("Clear All", ImVec2(bw, 0.f))) {
+        clearAll();
+        if (onBindingsChanged) onBindingsChanged();
+    }
     ImGui::TextDisabled("%d registered  /  %d mapped",
         (int)m_bindings.size(),
         (int)std::count_if(m_bindings.begin(), m_bindings.end(),
              [](auto& b){ return b.isMapped(); }));
+
+    if (drawEditorExtra) {
+        drawEditorExtra();
+    }
 
     ImGui::End();
 }
