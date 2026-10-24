@@ -22,7 +22,12 @@
 //
 // MIDI LEARN
 // ──────────
-//  Right-click any registered control → "MIDI Learn…" → move a CC → bound.
+//  Wrappers and watchLast(): right-click the control, then "Map MIDI".
+//  The status line reads Listening. Move a CC or note. It reads Mapped.
+//  On a Dear ImGui carrying SetWidgetValueCallback() (IMGUI_HAS_WIDGET_VALUE_CALLBACK),
+//  any other slider, drag, checkbox, or dropdown is learned from the widget
+//  itself, with no registration call at all. On stock Dear ImGui that mode is
+//  compiled out and the two registration paths above are the whole API.
 //
 // PERSISTENCE
 // ───────────
@@ -43,6 +48,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <sstream>
 
@@ -68,6 +74,11 @@ struct ImMidiBinding {
     // Two-way: UI change → send CC out
     bool  twoWay   {false};
     float lastSent {-1.f};  ///< last normalised value sent
+
+    /// Explicit controls (watchLast / wrappers) stay in the editor before a CC is learned.
+    bool listed {true};
+    bool hasPending {false};
+    int  pendingValue {0};
 
     bool isMapped() const { return cc >= 0; }
     bool isFloat()  const { return fTarget != nullptr; }
@@ -104,8 +115,8 @@ public:
     // Lifecycle
     // =========================================================================
 
-    ImMidiMapper()  = default;
-    ~ImMidiMapper() = default;
+    ImMidiMapper();
+    ~ImMidiMapper();
 
     /// Call every frame (e.g. in your main loop before ImGui::Render()).
     /// Applies any queued MIDI CC events to bound variables.
@@ -212,6 +223,13 @@ public:
     /// Draws the full mapping editor as an ImGui window.
     void drawEditor(bool* open = nullptr);
 
+    /// Draws the mapping editor contents inside the current ImGui window.
+    /// Use this when a host window (e.g. a dockable panel) already owns Begin()/End().
+    void drawEditorContents();
+
+    /// Listening / Mapped line. Safe to call once a frame from any window.
+    void drawStatus();
+
 private:
 
     // ── Queued CC events (filled on MIDI thread, drained on main thread) ─────
@@ -220,9 +238,40 @@ private:
     std::mutex           m_queueMutex;
 
     // ── State ────────────────────────────────────────────────────────────────
+    struct WidgetRec {
+        ImGuiID item {0};
+        int type {-1};
+        double minV {0};
+        double maxV {1};
+        bool hasRange {false};
+        void* heapPtr {nullptr};
+        std::string label;
+        std::string explicitId;
+        bool valid {false};
+    };
+
     std::vector<ImMidiBinding> m_bindings;
     std::string                m_learningId;
     std::set<std::string>      m_updatedThisFrame;
+    WidgetRec                  m_rec;
+    std::string                m_notice;
+    double                     m_noticeUntil {0};
+    int                        m_statusFrame {-1};
+
+#ifdef IMGUI_HAS_WIDGET_VALUE_CALLBACK
+    static bool widgetValueCallback(ImGuiWidgetValueCallbackData* data);
+    bool onWidget(ImGuiWidgetValueCallbackData* data);
+#endif
+    void noteWidgetOwner(const std::string& id, const void* ptr);
+    void foldAutos(const std::string& keepId, const void* ptr);
+    ImMidiBinding* findByPointer(const void* ptr);
+    void rememberTarget(ImMidiBinding& b, int type, void* data, double lo, double hi, bool hasRange);
+    void armWidget(const std::string& id, const std::string& label);
+    bool writeMidi(int type, void* data, const void* vmin, const void* vmax, int midiValue) const;
+    void drawMenuItems(const std::string& id, const std::string& label, bool allowArm);
+    static bool addressOnStack(const void* p);
+    static std::string widgetKey(ImGuiID id);
+    static std::string widgetLabel(const char* windowName, const char* label);
 
     // ── Internal helpers ─────────────────────────────────────────────────────
     ImMidiBinding& getOrCreate(const std::string& id);
@@ -252,6 +301,36 @@ private:
 // =============================================================================
 #ifdef IMMIDIMAPPER_IMPLEMENTATION
 
+#include "imgui_internal.h"
+
+// With IMGUI_HAS_WIDGET_VALUE_CALLBACK (a Dear ImGui carrying SetWidgetValueCallback()),
+// plain widgets are learned and driven automatically. Without it, this library works
+// exactly as it always has on stock Dear ImGui: bind(), watchLast() and the wrapper
+// widgets below are the registration paths, and no core hook is installed.
+ImMidiMapper::ImMidiMapper()
+{
+#ifdef IMGUI_HAS_WIDGET_VALUE_CALLBACK
+    ImGui::SetWidgetValueCallback(&ImMidiMapper::widgetValueCallback, this);
+#endif
+}
+
+ImMidiMapper::~ImMidiMapper()
+{
+#ifdef IMGUI_HAS_WIDGET_VALUE_CALLBACK
+    if (ImGui::GetWidgetValueCallback() == &ImMidiMapper::widgetValueCallback &&
+        ImGui::GetWidgetValueCallbackUserData() == this)
+        ImGui::SetWidgetValueCallback(nullptr);
+#endif
+}
+
+#ifdef IMGUI_HAS_WIDGET_VALUE_CALLBACK
+bool ImMidiMapper::widgetValueCallback(ImGuiWidgetValueCallbackData* data)
+{
+    auto* self = data ? static_cast<ImMidiMapper*>(data->UserData) : nullptr;
+    return self ? self->onWidget(data) : false;
+}
+#endif
+
 // ─────────────────────────────────────────────────────────────────────────────
 void ImMidiMapper::update()
 {
@@ -268,16 +347,25 @@ void ImMidiMapper::update()
         if (!m_learningId.empty()) {
             if (ev.isNote && ev.value <= 0) continue; // note-off is not a learn hit
             int effectiveCC = ev.isNote ? (128 + ev.cc) : ev.cc;
-            assign(m_learningId, ev.channel, effectiveCC);
-            if (onLearnComplete) onLearnComplete(m_learningId, ev.channel, effectiveCC);
+            const std::string learned = m_learningId;
+            assign(learned, ev.channel, effectiveCC);
+            if (onLearnComplete) onLearnComplete(learned, ev.channel, effectiveCC);
             m_learningId.clear();
+            m_notice = "Mapped";
+            m_noticeUntil = -1.0;
         }
 
         for (auto& b : m_bindings) {
             if (!b.isMapped()) continue;
             if (b.cc != (ev.isNote ? 128 + ev.cc : ev.cc)) continue;
             if (b.channel != 0 && b.channel != ev.channel) continue;
-            applyCC(b, ev.value);
+            const bool live = b.fTarget || b.iTarget || b.bTarget;
+            if (live)
+                applyCC(b, ev.value);
+            else {
+                b.hasPending = true;
+                b.pendingValue = ev.value;
+            }
             m_updatedThisFrame.insert(b.id);
         }
     }
@@ -312,7 +400,11 @@ ImMidiBinding& ImMidiMapper::bind(const std::string& id, float* val,
                                    const std::string& label)
 {
     auto& b = getOrCreate(id);
-    b.fTarget = val;  b.fMin = min;  b.fMax = max;
+    b.fTarget = val;
+    b.iTarget = nullptr;
+    b.bTarget = nullptr;
+    b.fMin = min;
+    b.fMax = max;
     if (!label.empty()) b.label = label;
     return b;
 }
@@ -321,7 +413,11 @@ ImMidiBinding& ImMidiMapper::bind(const std::string& id, int* val,
                                    const std::string& label)
 {
     auto& b = getOrCreate(id);
-    b.iTarget = val;  b.iMin = min;  b.iMax = max;
+    b.iTarget = val;
+    b.fTarget = nullptr;
+    b.bTarget = nullptr;
+    b.iMin = min;
+    b.iMax = max;
     if (!label.empty()) b.label = label;
     return b;
 }
@@ -330,6 +426,8 @@ ImMidiBinding& ImMidiMapper::bind(const std::string& id, bool* val,
 {
     auto& b = getOrCreate(id);
     b.bTarget = val;
+    b.fTarget = nullptr;
+    b.iTarget = nullptr;
     if (!label.empty()) b.label = label;
     return b;
 }
@@ -362,10 +460,22 @@ const ImMidiBinding* ImMidiMapper::findBinding(const std::string& id) const
 // ─────────────────────────────────────────────────────────────────────────────
 void ImMidiMapper::startLearn(const std::string& id)
 {
+    if (!m_learningId.empty() && m_learningId != id)
+        stopLearn();
     getOrCreate(id);
     m_learningId = id;
 }
-void ImMidiMapper::stopLearn() { m_learningId.clear(); }
+void ImMidiMapper::stopLearn()
+{
+    const std::string id = m_learningId;
+    m_learningId.clear();
+    m_notice.clear();
+    m_noticeUntil = 0;
+    if (auto* b = findBinding(id)) {
+        if (!b->listed && !b->isMapped())
+            unbind(id);
+    }
+}
 
 void ImMidiMapper::assign(const std::string& id, int channel, int cc)
 {
@@ -376,7 +486,17 @@ void ImMidiMapper::assign(const std::string& id, int channel, int cc)
 void ImMidiMapper::clearBinding(const std::string& id)
 {
     auto* b = findBinding(id);
-    if (b) { b->cc = -1; b->channel = 0; }
+    if (!b)
+        return;
+    if (!b->listed) {
+        if (m_learningId == id)
+            m_learningId.clear();
+        unbind(id);
+        return;
+    }
+    b->cc = -1;
+    b->channel = 0;
+    b->hasPending = false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -427,31 +547,10 @@ void ImMidiMapper::drawIndicator(const std::string& /*id*/)
 void ImMidiMapper::handleContextMenu(const std::string& id,
                                       const std::string& label)
 {
-    if (!ImGui::IsItemHovered()) return;
-    std::string pid = "##imm_ctx_" + id;
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Right))
-        ImGui::OpenPopup(pid.c_str());
-
-    if (!ImGui::BeginPopup(pid.c_str())) return;
-
-    auto* b = findBinding(id);
-    ImGui::TextDisabled("%s", label.c_str());
-    ImGui::Separator();
-
-    if (isLearning(id)) {
-        ImGui::TextColored({1.f, 0.88f, 0.f, 1.f}, "* Waiting for CC...");
-        if (ImGui::MenuItem("Cancel")) stopLearn();
-    } else {
-        if (ImGui::MenuItem("MIDI Learn...")) startLearn(id);
-    }
-
-    if (b && b->isMapped()) {
-        if (ImGui::MenuItem("Clear Mapping")) clearBinding(id);
-        ImGui::Separator();
-        ImGui::TextDisabled("ch %d  CC %d", b->channel == 0 ? 1 : b->channel, b->cc);
-        ImGui::Checkbox("Two-way (UI -> CC out)", &b->twoWay);
-    }
-
+    const std::string pid = "##imm_" + id;
+    if (!ImGui::BeginPopupContextItem(pid.c_str(), ImGuiPopupFlags_MouseButtonRight))
+        return;
+    drawMenuItems(id, label, false);
     ImGui::EndPopup();
 }
 
@@ -462,7 +561,16 @@ bool ImMidiMapper::postWidget(const std::string& id, const std::string& label,
                                bool widgetChanged)
 {
     drawIndicator(id);
-    handleContextMenu(id, label);
+#ifdef IMGUI_HAS_WIDGET_VALUE_CALLBACK
+    bool opened = false;
+    if (ImGui::BeginPopupContextWidget(&opened)) {
+        if (opened)
+            ImGui::EndPopupContextWidget();
+    } else
+#endif
+    {
+        handleContextMenu(id, label);
+    }
     bool midiChanged = (m_updatedThisFrame.count(id) > 0);
     if (widgetChanged || ImGui::IsItemDeactivatedAfterEdit()) {
         if (auto* b = findBinding(id)) sendCC(*b);
@@ -524,6 +632,8 @@ bool ImMidiMapper::watchLast(const std::string& id, float* val,
                                float min, float max, const std::string& label)
 {
     bind(id, val, min, max, label.empty() ? id : label);
+    foldAutos(id, val);
+    noteWidgetOwner(id, val);
     return postWidget(id, label.empty() ? id : label,
                       /*widgetChanged=*/false);
 }
@@ -531,12 +641,16 @@ bool ImMidiMapper::watchLast(const std::string& id, int* val,
                                int min, int max, const std::string& label)
 {
     bind(id, val, min, max, label.empty() ? id : label);
+    foldAutos(id, val);
+    noteWidgetOwner(id, val);
     return postWidget(id, label.empty() ? id : label, false);
 }
 bool ImMidiMapper::watchLast(const std::string& id, bool* val,
                                const std::string& label)
 {
     bind(id, val, label.empty() ? id : label);
+    foldAutos(id, val);
+    noteWidgetOwner(id, val);
     return postWidget(id, label.empty() ? id : label, false);
 }
 
@@ -693,6 +807,8 @@ void ImMidiMapper::drawBindingTable(float footerH)
 
     bool changed = false;
     for (auto& b : m_bindings) {
+        if (!b.listed && !b.isMapped() && m_learningId != b.id)
+            continue;
         ImGui::TableNextRow();
         ImGui::PushID(b.id.c_str());
 
@@ -736,7 +852,7 @@ void ImMidiMapper::drawBindingTable(float footerH)
         if (isLearning(b.id)) {
             if (ImGui::SmallButton("Cancel")) stopLearn();
         } else {
-            if (ImGui::SmallButton("Learn"))  startLearn(b.id);
+            if (ImGui::SmallButton("Map"))  startLearn(b.id);
         }
         ImGui::SameLine();
         ImGui::BeginDisabled(!b.isMapped());
@@ -756,15 +872,25 @@ void ImMidiMapper::drawEditor(bool* open)
     if (!ImGui::Begin("MIDI Mapper###ImMidiMapper", open)) {
         ImGui::End();  return;
     }
+    drawEditorContents();
+    ImGui::End();
+}
 
+void ImMidiMapper::drawEditorContents()
+{
     // Optional: custom port-selector drawn by the backend.
     // A full-width control at the end of that UI is the break; no extra rule.
     if (drawPortsUI) drawPortsUI();
 
+    drawStatus();
     if (!m_learningId.empty()) {
+        const char* name = m_learningId.c_str();
+        if (auto* b = findBinding(m_learningId)) {
+            if (!b->label.empty())
+                name = b->label.c_str();
+        }
         ImGui::AlignTextToFramePadding();
-        ImGui::TextColored({1.f, 0.88f, 0.f, 1.f},
-            "* Learning: %s  -- move a CC knob/fader", m_learningId.c_str());
+        ImGui::TextColored({1.f, 0.88f, 0.f, 1.f}, "Listening  %s", name);
         ImGui::SameLine();
         if (ImGui::SmallButton("Cancel")) stopLearn();
         ImGui::Spacing();
@@ -798,8 +924,348 @@ void ImMidiMapper::drawEditor(bool* open)
     if (drawEditorExtra) {
         drawEditorExtra();
     }
+}
 
-    ImGui::End();
+bool ImMidiMapper::addressOnStack(const void* p)
+{
+    if (!p)
+        return false;
+    const char here = 0;
+    const auto a = reinterpret_cast<std::uintptr_t>(p);
+    const auto b = reinterpret_cast<std::uintptr_t>(&here);
+    const auto dist = a > b ? a - b : b - a;
+    return dist < (static_cast<std::uintptr_t>(1) << 20);
+}
+
+std::string ImMidiMapper::widgetKey(ImGuiID id)
+{
+    return "w:" + std::to_string(id);
+}
+
+std::string ImMidiMapper::widgetLabel(const char* windowName, const char* label)
+{
+    std::string win = windowName ? windowName : "";
+    const auto hash = win.find("###");
+    if (hash != std::string::npos)
+        win.resize(hash);
+    const char* text = label ? label : "";
+    const char* end = ImGui::FindRenderedTextEnd(text);
+    std::string vis(text, end);
+    if (vis.empty())
+        return win.empty() ? std::string("control") : win;
+    if (win.empty())
+        return vis;
+    return win + " / " + vis;
+}
+
+bool ImMidiMapper::writeMidi(int type, void* data, const void* vmin, const void* vmax,
+                              int midiValue) const
+{
+    if (!data)
+        return false;
+    const float n = std::clamp(midiValue / 127.f, 0.f, 1.f);
+    if (type == ImGuiDataType_Float) {
+        float lo = 0.f, hi = 1.f;
+        if (vmin && vmax) {
+            lo = *static_cast<const float*>(vmin);
+            hi = *static_cast<const float*>(vmax);
+        }
+        if (!(hi > lo)) {
+            lo = 0.f;
+            hi = 1.f;
+        }
+        float& dst = *static_cast<float*>(data);
+        const float v = lo + n * (hi - lo);
+        if (dst == v)
+            return false;
+        dst = v;
+        return true;
+    }
+    if (type == ImGuiDataType_Double) {
+        double lo = 0.0, hi = 1.0;
+        if (vmin && vmax) {
+            lo = *static_cast<const double*>(vmin);
+            hi = *static_cast<const double*>(vmax);
+        }
+        if (!(hi > lo)) {
+            lo = 0.0;
+            hi = 1.0;
+        }
+        double& dst = *static_cast<double*>(data);
+        const double v = lo + static_cast<double>(n) * (hi - lo);
+        if (dst == v)
+            return false;
+        dst = v;
+        return true;
+    }
+    if (type == ImGuiDataType_S32) {
+        int lo = 0, hi = 127;
+        if (vmin && vmax) {
+            lo = *static_cast<const int*>(vmin);
+            hi = *static_cast<const int*>(vmax);
+        }
+        if (!(hi > lo)) {
+            lo = 0;
+            hi = 127;
+        }
+        int& dst = *static_cast<int*>(data);
+        const int v = static_cast<int>(std::lround(lo + n * static_cast<float>(hi - lo)));
+        if (dst == v)
+            return false;
+        dst = v;
+        return true;
+    }
+    if (type == ImGuiDataType_Bool) {
+        bool& dst = *static_cast<bool*>(data);
+        const bool v = midiValue >= 64;
+        if (dst == v)
+            return false;
+        dst = v;
+        return true;
+    }
+    return false;
+}
+
+ImMidiBinding* ImMidiMapper::findByPointer(const void* p)
+{
+    if (!p)
+        return nullptr;
+    ImMidiBinding* fallback = nullptr;
+    for (auto& b : m_bindings) {
+        const void* t = b.fTarget ? static_cast<void*>(b.fTarget)
+                                  : b.iTarget ? static_cast<void*>(b.iTarget)
+                                              : static_cast<void*>(b.bTarget);
+        if (t != p)
+            continue;
+        if (b.listed)
+            return &b;
+        if (!fallback)
+            fallback = &b;
+    }
+    return fallback;
+}
+
+void ImMidiMapper::rememberTarget(ImMidiBinding& b, int type, void* data, double lo, double hi,
+                                  bool hasRange)
+{
+    const bool listed = b.listed;
+    const std::string id = b.id;
+    const std::string label = b.label;
+    if (type == ImGuiDataType_Float) {
+        float a = hasRange ? static_cast<float>(lo) : 0.f;
+        float c = hasRange ? static_cast<float>(hi) : 1.f;
+        if (!(c > a)) {
+            a = 0.f;
+            c = 1.f;
+        }
+        bind(id, static_cast<float*>(data), a, c, label).listed = listed;
+    } else if (type == ImGuiDataType_S32) {
+        int a = hasRange ? static_cast<int>(lo) : 0;
+        int c = hasRange ? static_cast<int>(hi) : 127;
+        if (!(c > a)) {
+            a = 0;
+            c = 127;
+        }
+        bind(id, static_cast<int*>(data), a, c, label).listed = listed;
+    } else if (type == ImGuiDataType_Bool) {
+        bind(id, static_cast<bool*>(data), label).listed = listed;
+    }
+}
+
+void ImMidiMapper::armWidget(const std::string& id, const std::string& label)
+{
+    auto& created = getOrCreate(id);
+    if (!label.empty())
+        created.label = label;
+    created.listed = false;
+    if (!m_rec.heapPtr)
+        return;
+    rememberTarget(created, m_rec.type, m_rec.heapPtr, m_rec.minV, m_rec.maxV, m_rec.hasRange);
+    if (auto* b = findBinding(id))
+        b->listed = false;
+}
+
+void ImMidiMapper::foldAutos(const std::string& keepId, const void* ptr)
+{
+    if (!ptr)
+        return;
+    auto* keep = findBinding(keepId);
+    if (!keep)
+        return;
+    std::vector<std::string> drop;
+    for (const auto& b : m_bindings) {
+        if (b.id == keepId || b.listed)
+            continue;
+        const void* t = b.fTarget ? static_cast<void*>(b.fTarget)
+                                  : b.iTarget ? static_cast<void*>(b.iTarget)
+                                              : static_cast<void*>(b.bTarget);
+        if (t != ptr)
+            continue;
+        if (b.isMapped() && !keep->isMapped()) {
+            keep->channel = b.channel;
+            keep->cc = b.cc;
+            keep->twoWay = b.twoWay;
+        }
+        if (m_learningId == b.id)
+            m_learningId = keepId;
+        drop.push_back(b.id);
+    }
+    for (const auto& id : drop)
+        unbind(id);
+}
+
+void ImMidiMapper::noteWidgetOwner(const std::string& id, const void* ptr)
+{
+    if (!m_rec.valid || !ptr || m_rec.item != ImGui::GetItemID())
+        return;
+    m_rec.explicitId = id;
+}
+
+#ifdef IMGUI_HAS_WIDGET_VALUE_CALLBACK
+bool ImMidiMapper::onWidget(ImGuiWidgetValueCallbackData* ev)
+{
+    if (!ev)
+        return false;
+    if (ev->Phase == ImGuiWidgetValueCallbackPhase_ContextMenuQuery)
+        return m_rec.valid && m_rec.item == ev->ID;
+    if (ev->Phase == ImGuiWidgetValueCallbackPhase_ContextMenuDraw) {
+        const std::string id = m_rec.explicitId.empty() ? widgetKey(m_rec.item) : m_rec.explicitId;
+        const ImMidiBinding* b = findBinding(id);
+        const std::string label = (b && !b->label.empty()) ? b->label : m_rec.label;
+        drawMenuItems(id, label, m_rec.explicitId.empty());
+        return false;
+    }
+
+    const int type = ev->DataType;
+    const bool supported = type == ImGuiDataType_Float || type == ImGuiDataType_Double ||
+                           type == ImGuiDataType_S32 || type == ImGuiDataType_Bool;
+    if (!supported || !ev->Value || ev->ID == 0)
+        return false;
+
+    const std::string key = widgetKey(ev->ID);
+    if (ev->Phase == ImGuiWidgetValueCallbackPhase_BeforeSubmit) {
+        ImMidiBinding* b = nullptr;
+        if (!addressOnStack(ev->Value))
+            b = findByPointer(ev->Value);
+        if (!b)
+            b = findBinding(key);
+        if (!b)
+            return false;
+        if (b->hasPending) {
+            const bool wrote = writeMidi(type, ev->Value, ev->ValueMin, ev->ValueMax, b->pendingValue);
+            b->hasPending = false;
+            return wrote;
+        }
+        return m_updatedThisFrame.count(b->id) > 0;
+    }
+
+    m_rec.valid = true;
+    m_rec.item = ev->ID;
+    m_rec.type = type;
+    m_rec.heapPtr = (type == ImGuiDataType_Double || addressOnStack(ev->Value)) ? nullptr : ev->Value;
+    m_rec.hasRange = ev->ValueMin && ev->ValueMax && type != ImGuiDataType_Bool;
+    m_rec.minV = 0;
+    m_rec.maxV = 1;
+    if (m_rec.hasRange && type == ImGuiDataType_Float) {
+        m_rec.minV = *static_cast<const float*>(ev->ValueMin);
+        m_rec.maxV = *static_cast<const float*>(ev->ValueMax);
+    } else if (m_rec.hasRange && type == ImGuiDataType_Double) {
+        m_rec.minV = *static_cast<const double*>(ev->ValueMin);
+        m_rec.maxV = *static_cast<const double*>(ev->ValueMax);
+    } else if (m_rec.hasRange && type == ImGuiDataType_S32) {
+        m_rec.minV = *static_cast<const int*>(ev->ValueMin);
+        m_rec.maxV = *static_cast<const int*>(ev->ValueMax);
+    }
+    const char* win = ImGui::GetCurrentWindow() ? ImGui::GetCurrentWindow()->Name : "";
+    m_rec.label = widgetLabel(win, ev->Label);
+    m_rec.explicitId.clear();
+    if (m_rec.heapPtr) {
+        if (auto* b = findByPointer(m_rec.heapPtr)) {
+            m_rec.explicitId = b->id;
+            if (!b->label.empty())
+                m_rec.label = b->label;
+            rememberTarget(*b, type, m_rec.heapPtr, m_rec.minV, m_rec.maxV, m_rec.hasRange);
+        }
+    }
+    if (auto* byKey = findBinding(key)) {
+        if (m_rec.explicitId.empty())
+            m_rec.explicitId = byKey->id;
+        if (m_rec.heapPtr && byKey->id != m_rec.explicitId)
+            rememberTarget(*byKey, type, m_rec.heapPtr, m_rec.minV, m_rec.maxV, m_rec.hasRange);
+    }
+    return false;
+}
+#endif // IMGUI_HAS_WIDGET_VALUE_CALLBACK
+
+void ImMidiMapper::drawMenuItems(const std::string& id, const std::string& label, bool allowArm)
+{
+    ImGui::TextDisabled("%s", label.c_str());
+    ImGui::Separator();
+    if (isLearning(id)) {
+        ImGui::TextColored(ImVec4(1.f, 0.88f, 0.f, 1.f), "Listening");
+        if (ImGui::MenuItem("Cancel"))
+            stopLearn();
+    } else if (ImGui::MenuItem("Map MIDI")) {
+        if (allowArm && !findBinding(id))
+            armWidget(id, label);
+        startLearn(id);
+        m_statusFrame = -1;
+        drawStatus();
+    }
+    if (auto* live = findBinding(id); live && live->isMapped()) {
+        if (ImGui::MenuItem("Clear Mapping")) {
+            clearBinding(id);
+            if (onBindingsChanged)
+                onBindingsChanged();
+        } else {
+            ImGui::Separator();
+            ImGui::TextDisabled("ch %d  CC %d", live->channel == 0 ? 1 : live->channel, live->cc);
+            if (ImGui::Checkbox("Two-way (UI -> CC out)", &live->twoWay) && onBindingsChanged)
+                onBindingsChanged();
+        }
+    }
+}
+
+void ImMidiMapper::drawStatus()
+{
+    if (!ImGui::GetCurrentContext() || ImGui::GetFont() == nullptr)
+        return;
+    const int frame = ImGui::GetFrameCount();
+    if (m_statusFrame == frame)
+        return;
+
+    const bool listening = !m_learningId.empty();
+    if (!listening && m_notice == "Mapped" && m_noticeUntil < 0.0)
+        m_noticeUntil = ImGui::GetTime() + 1.5;
+    const bool mapped = !listening && m_notice == "Mapped" && ImGui::GetTime() < m_noticeUntil;
+    if (!listening && !mapped) {
+        m_statusFrame = frame;
+        return;
+    }
+    m_statusFrame = frame;
+
+    const char* head = listening ? "Listening" : "Mapped";
+    const char* sub = listening ? "Wiggle a control" : nullptr;
+    const ImVec2 headSize = ImGui::CalcTextSize(head);
+    const ImVec2 subSize = sub ? ImGui::CalcTextSize(sub) : ImVec2(0.f, 0.f);
+    const ImVec2 pad = ImGui::GetStyle().FramePadding;
+    const float gap = sub ? ImGui::GetStyle().ItemSpacing.y : 0.f;
+    const ImVec2 box(std::max(headSize.x, subSize.x) + pad.x * 2.f,
+                     headSize.y + (sub ? subSize.y + gap : 0.f) + pad.y * 2.f);
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const ImVec2 pos(vp->WorkPos.x + (vp->WorkSize.x - box.x) * 0.5f,
+                     vp->WorkPos.y + vp->WorkSize.y - box.y - ImGui::GetFontSize());
+    const ImVec2 boxMax(pos.x + box.x, pos.y + box.y);
+    ImDrawList* dl = ImGui::GetForegroundDrawList(const_cast<ImGuiViewport*>(vp));
+    const float rounding = ImGui::GetStyle().FrameRounding;
+    dl->AddRectFilled(pos, boxMax, ImGui::GetColorU32(ImGuiCol_WindowBg), rounding);
+    dl->AddRect(pos, boxMax, ImGui::GetColorU32(ImGuiCol_Border), rounding);
+    const ImU32 headCol = listening ? IM_COL32(255, 224, 0, 255)
+                                    : ImGui::GetColorU32(ImGuiCol_CheckMark);
+    dl->AddText(ImVec2(pos.x + pad.x, pos.y + pad.y), headCol, head);
+    if (sub)
+        dl->AddText(ImVec2(pos.x + pad.x, pos.y + pad.y + headSize.y + gap),
+                    ImGui::GetColorU32(ImGuiCol_Text), sub);
 }
 
 #endif // IMMIDIMAPPER_IMPLEMENTATION
